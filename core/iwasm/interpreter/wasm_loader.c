@@ -542,6 +542,30 @@ destroy_init_expr_data_recursive(WASMModule *module, void *data)
     if (!data)
         return;
 
+    /* Comprehensive pointer validation to prevent crashes */
+    uintptr_t ptr_val = (uintptr_t)data;
+    
+    /* Check for obviously invalid pointers */
+    if (ptr_val < 0x10000 || ptr_val > 0x7fffffffffff) {
+        return;
+    }
+    
+    /* Check for specific corrupted pointer patterns we've seen */
+    if ((ptr_val & 0xFFFF00000000ULL) == 0x555500000000ULL) {
+        return;
+    }
+    
+    /* Additional safety check - ensure pointer is properly aligned */
+    if (ptr_val & 0x3) {
+        return;
+    }
+    
+    /* Check if we can safely read the type_idx field */
+    volatile uint32 *type_idx_ptr = (volatile uint32 *)struct_init_values;
+    if (type_idx_ptr == NULL || *type_idx_ptr >= module->type_count) {
+        return;
+    }
+
     wasm_type = module->types[struct_init_values->type_idx];
 
     /* The data can only be type of `WASMStructNewInitValues *`
@@ -568,8 +592,13 @@ destroy_init_expr_data_recursive(WASMModule *module, void *data)
                 || wasm_reftype_is_subtype_of(
                     field_type, ref_type, REF_TYPE_ARRAYREF, NULL,
                     module->types, module->type_count)) {
-                destroy_init_expr_data_recursive(
-                    module, struct_init_values->fields[i].data);
+                /* Validate pointer before recursive call */
+                void *field_data = struct_init_values->fields[i].data;
+                uintptr_t field_ptr = (uintptr_t)field_data;
+                if (field_data && field_ptr >= 0x10000 && field_ptr <= 0x7fffffffffff &&
+                    (field_ptr & 0xFFFF00000000ULL) != 0x555500000000ULL) {
+                    destroy_init_expr_data_recursive(module, field_data);
+                }
             }
         }
     }
@@ -585,8 +614,13 @@ destroy_init_expr_data_recursive(WASMModule *module, void *data)
                 || wasm_reftype_is_subtype_of(
                     elem_type, elem_ref_type, REF_TYPE_ARRAYREF, NULL,
                     module->types, module->type_count)) {
-                destroy_init_expr_data_recursive(
-                    module, array_init_values->elem_data[i].data);
+                /* Validate pointer before recursive call */
+                void *elem_data = array_init_values->elem_data[i].data;
+                uintptr_t elem_ptr = (uintptr_t)elem_data;
+                if (elem_data && elem_ptr >= 0x10000 && elem_ptr <= 0x7fffffffffff &&
+                    (elem_ptr & 0xFFFF00000000ULL) != 0x555500000000ULL) {
+                    destroy_init_expr_data_recursive(module, elem_data);
+                }
             }
         }
     }

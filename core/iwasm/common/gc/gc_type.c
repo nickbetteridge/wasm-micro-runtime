@@ -543,7 +543,7 @@ wasm_func_type_result_is_subtype_of(const WASMFuncType *type1,
         if (wasm_is_type_multi_byte_type(
                 type2->types[type2->param_count + i])) {
             bh_assert(ref_type_map2
-                      && ref_type_map2->index == type1->param_count + i);
+                      && ref_type_map2->index == type2->param_count + i);
             ref_type2 = ref_type_map2->ref_type;
             ref_type_map2++;
         }
