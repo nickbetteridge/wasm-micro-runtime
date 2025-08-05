@@ -970,7 +970,7 @@ globals_deinstantiate(WASMGlobalInstance *globals)
 
 static bool
 check_global_init_expr(const WASMModule *module, uint32 global_index,
-                       char *error_buf, uint32 error_buf_size)
+                       uint32 current_global_index, char *error_buf, uint32 error_buf_size)
 {
     if (global_index >= module->import_global_count + module->global_count) {
         set_error_buf_v(error_buf, error_buf_size, "unknown global %d",
@@ -980,17 +980,32 @@ check_global_init_expr(const WASMModule *module, uint32 global_index,
 
 #if WASM_ENABLE_GC == 0
     /**
-     * Currently, constant expressions occurring as initializers of
-     * globals are further constrained in that contained global.get
-     * instructions are only allowed to refer to imported globals.
-     *
-     * And initializer expression cannot reference a mutable global.
+     * Enhanced constant expressions: global.get instructions can now
+     * reference imported globals or preceding immutable local globals.
+     * Mutable globals are not allowed in constant expressions.
      */
-    if (global_index >= module->import_global_count
-        || (module->import_globals + global_index)->u.global.type.is_mutable) {
+    if (global_index >= current_global_index) {
         set_error_buf(error_buf, error_buf_size,
-                      "constant expression required");
+                      "global.get can only reference preceding globals in constant expressions");
         return false;
+    }
+    
+    /* Check if referenced global is mutable */
+    if (global_index < module->import_global_count) {
+        /* Imported global */
+        if ((module->import_globals + global_index)->u.global.type.is_mutable) {
+            set_error_buf(error_buf, error_buf_size,
+                          "constant expression cannot reference mutable global");
+            return false;
+        }
+    } else {
+        /* Local global */
+        uint32 local_index = global_index - module->import_global_count;
+        if ((module->globals + local_index)->type.is_mutable) {
+            set_error_buf(error_buf, error_buf_size,
+                          "constant expression cannot reference mutable global");
+            return false;
+        }
     }
 #endif
 
@@ -998,6 +1013,15 @@ check_global_init_expr(const WASMModule *module, uint32 global_index,
 }
 
 #if WASM_ENABLE_GC != 0
+/* Forward declaration */
+static WASMArrayObjectRef
+instantiate_array_global_recursive(WASMModule *module,
+                                   WASMModuleInstance *module_inst,
+                                   uint32 type_idx, uint8 flag, uint32 len,
+                                   WASMValue *array_init_value,
+                                   WASMArrayNewInitValues *init_values,
+                                   char *error_buf, uint32 error_buf_size);
+
 /* Instantiate struct global variable recursively */
 static WASMStructObjectRef
 instantiate_struct_global_recursive(WASMModule *module,
@@ -1074,11 +1098,37 @@ instantiate_struct_global_recursive(WASMModule *module,
                                               &field_value);
                 }
                 else if (wasm_type->type_flag == WASM_TYPE_ARRAY) {
-                    /* struct object's field is an array obj */
-                    set_error_buf(error_buf, error_buf_size,
-                                  "array as a field in struct object is "
-                                  "not supported in constant init expr");
-                    return NULL;
+                    /* Handle array as field in struct - similar to struct handling */
+                    WASMArrayNewInitValues *init_values1 =
+                        (WASMArrayNewInitValues *)wasm_value->data;
+                    WASMArrayObjectRef field;
+                    uint8 array_flag;
+                    uint32 array_len = 0;
+                    WASMValue *array_init_val = NULL;
+                    
+                    if (init_values1) {
+                        /* Array with initialization data */
+                        array_flag = INIT_EXPR_TYPE_ARRAY_NEW_FIXED;
+                        array_len = init_values1->length;
+                        array_init_val = init_values1->elem_data;
+                    } else {
+                        /* Default array initialization */
+                        array_flag = INIT_EXPR_TYPE_ARRAY_NEW_DEFAULT;
+                        array_len = 0;
+                        array_init_val = NULL;
+                    }
+                    
+                    field = instantiate_array_global_recursive(
+                        module, module_inst, heap_type, array_flag, 
+                        array_len, array_init_val, init_values1, 
+                        error_buf, error_buf_size);
+                    
+                    if (!field) {
+                        return NULL;
+                    }
+                    field_value.gc_obj = (WASMObjectRef)field;
+                    wasm_struct_obj_set_field(struct_obj, field_idx,
+                                              &field_value);
                 }
                 else if (wasm_type->type_flag == WASM_TYPE_FUNC) {
                     WASMFuncObjectRef func_obj = NULL;
@@ -1168,14 +1218,14 @@ instantiate_array_global_recursive(WASMModule *module,
 static bool
 get_init_value_recursive(WASMModule *module, InitializerExpression *expr,
                          WASMGlobalInstance *globals, WASMValue *value,
-                         char *error_buf, uint32 error_buf_size)
+                         uint32 current_global_index, char *error_buf, uint32 error_buf_size)
 {
     uint8 flag = expr->init_expr_type;
     switch (flag) {
         case INIT_EXPR_TYPE_GET_GLOBAL:
         {
             if (!check_global_init_expr(module, expr->u.unary.v.global_index,
-                                        error_buf, error_buf_size)) {
+                                        current_global_index, error_buf, error_buf_size)) {
                 goto fail;
             }
 
@@ -1201,13 +1251,13 @@ get_init_value_recursive(WASMModule *module, InitializerExpression *expr,
                 goto fail;
             }
             if (!get_init_value_recursive(module, expr->u.binary.l_expr,
-                                          globals, &l_value, error_buf,
-                                          error_buf_size)) {
+                                          globals, &l_value, current_global_index,
+                                          error_buf, error_buf_size)) {
                 goto fail;
             }
             if (!get_init_value_recursive(module, expr->u.binary.r_expr,
-                                          globals, &r_value, error_buf,
-                                          error_buf_size)) {
+                                          globals, &r_value, current_global_index,
+                                          error_buf, error_buf_size)) {
                 goto fail;
             }
 
@@ -1333,8 +1383,9 @@ globals_instantiate(WASMModule *module, WASMModuleInstance *module_inst,
 #endif
             {
                 if (!get_init_value_recursive(module, init_expr, globals,
-                                              &global->initial_value, error_buf,
-                                              error_buf_size)) {
+                                              &global->initial_value, 
+                                              module->import_global_count + i,
+                                              error_buf, error_buf_size)) {
                     goto fail;
                 }
                 break;
@@ -2807,7 +2858,7 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
                                           : is_valid_i32_offset(offset_flag)));
 
         if (!get_init_value_recursive(module, &data_seg->base_offset, globals,
-                                      &offset_value, error_buf,
+                                      &offset_value, UINT32_MAX, error_buf,
                                       error_buf_size)) {
             goto fail;
         }
@@ -2911,7 +2962,7 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
         if (table->init_expr.init_expr_type == INIT_EXPR_TYPE_GET_GLOBAL) {
             if (!check_global_init_expr(module,
                                         table->init_expr.u.unary.v.global_index,
-                                        error_buf, error_buf_size)) {
+                                        UINT32_MAX, error_buf, error_buf_size)) {
                 goto fail;
             }
 
@@ -3024,7 +3075,7 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
 #endif
 
         if (!get_init_value_recursive(module, &table_seg->base_offset, globals,
-                                      &offset_value, error_buf,
+                                      &offset_value, UINT32_MAX, error_buf,
                                       error_buf_size)) {
             goto fail;
         }
@@ -3111,7 +3162,7 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
                 {
                     if (!check_global_init_expr(
                             module, init_expr->u.unary.v.global_index,
-                            error_buf, error_buf_size)) {
+                            UINT32_MAX, error_buf, error_buf_size)) {
                         goto fail;
                     }
 
