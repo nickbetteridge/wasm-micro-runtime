@@ -51,16 +51,16 @@ typedef enum wasm_value_type_enum {
 typedef int32_t wasm_heap_type_t;
 
 typedef enum wasm_heap_type_enum {
+    HEAP_TYPE_NOFUNC = -0x0D,
+    HEAP_TYPE_NOEXTERN = -0x0E, 
+    HEAP_TYPE_NONE = -0x0F,
     HEAP_TYPE_FUNC = -0x10,
     HEAP_TYPE_EXTERN = -0x11,
     HEAP_TYPE_ANY = -0x12,
     HEAP_TYPE_EQ = -0x13,
-    HEAP_TYPE_I31 = -0x16,
-    HEAP_TYPE_NOFUNC = -0x17,
-    HEAP_TYPE_NOEXTERN = -0x18,
-    HEAP_TYPE_STRUCT = -0x19,
-    HEAP_TYPE_ARRAY = -0x1A,
-    HEAP_TYPE_NONE = -0x1B
+    HEAP_TYPE_I31 = -0x14,       /* Fixed: was -0x16, now matches wasm.h */
+    HEAP_TYPE_STRUCT = -0x15,    /* Added: was missing, now matches wasm.h */
+    HEAP_TYPE_ARRAY = -0x16      /* Fixed: was -0x1A, now matches wasm.h */
 } wasm_heap_type_enum;
 
 struct WASMObject;

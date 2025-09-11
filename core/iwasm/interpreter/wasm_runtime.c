@@ -998,6 +998,15 @@ check_global_init_expr(const WASMModule *module, uint32 global_index,
 }
 
 #if WASM_ENABLE_GC != 0
+/* Forward declaration */
+static WASMArrayObjectRef
+instantiate_array_global_recursive(WASMModule *module,
+                                   WASMModuleInstance *module_inst,
+                                   uint32 type_idx, uint8 flag, uint32 len,
+                                   WASMValue *array_init_value,
+                                   WASMArrayNewInitValues *init_values,
+                                   char *error_buf, uint32 error_buf_size);
+
 /* Instantiate struct global variable recursively */
 static WASMStructObjectRef
 instantiate_struct_global_recursive(WASMModule *module,
@@ -1075,10 +1084,35 @@ instantiate_struct_global_recursive(WASMModule *module,
                 }
                 else if (wasm_type->type_flag == WASM_TYPE_ARRAY) {
                     /* struct object's field is an array obj */
-                    set_error_buf(error_buf, error_buf_size,
-                                  "array as a field in struct object is "
-                                  "not supported in constant init expr");
-                    return NULL;
+                    WASMArrayNewInitValues *init_values1 =
+                        (WASMArrayNewInitValues *)wasm_value->data;
+                    WASMArrayObjectRef array_field = NULL;
+                    WASMValue *array_init_value = NULL, empty_value = { 0 };
+                    uint32 len;
+                    uint8 array_flag;
+
+                    if (init_values1) {
+                        /* array.new_fixed or array.new */
+                        len = init_values1->length;
+                        array_init_value = init_values1->elem_data;
+                        array_flag = INIT_EXPR_TYPE_ARRAY_NEW_FIXED;
+                    }
+                    else {
+                        /* array.new_default */
+                        len = wasm_value->u32;
+                        array_init_value = &empty_value;
+                        array_flag = INIT_EXPR_TYPE_ARRAY_NEW_DEFAULT;
+                    }
+
+                    array_field = instantiate_array_global_recursive(
+                        module, module_inst, heap_type, array_flag, len,
+                        array_init_value, init_values1, error_buf, error_buf_size);
+                    if (!array_field) {
+                        return NULL;
+                    }
+                    field_value.gc_obj = (WASMObjectRef)array_field;
+                    wasm_struct_obj_set_field(struct_obj, field_idx,
+                                              &field_value);
                 }
                 else if (wasm_type->type_flag == WASM_TYPE_FUNC) {
                     WASMFuncObjectRef func_obj = NULL;

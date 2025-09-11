@@ -4363,16 +4363,27 @@ load_global_section(const uint8 *buf, const uint8 *buf_end, WASMModule *module,
                                       .u.global.type.val_type;
                     global_ref_type =
                         module->import_globals[global_idx].u.global.ref_type;
+#if WASM_ENABLE_GC != 0
+                    /* WebAssembly GC: global.get in constant expressions can only access immutable globals */
+                    if (module->import_globals[global_idx].u.global.type.is_mutable) {
+                        set_error_buf(error_buf, error_buf_size, 
+                                      "global.get can only access immutable globals in constant expressions");
+                        return false;
+                    }
+#endif
                 }
                 else {
-                    global_type =
-                        module
-                            ->globals[global_idx - module->import_global_count]
-                            .type.val_type;
-                    global_ref_type =
-                        module
-                            ->globals[global_idx - module->import_global_count]
-                            .ref_type;
+                    uint32 module_global_idx = global_idx - module->import_global_count;
+                    global_type = module->globals[module_global_idx].type.val_type;
+                    global_ref_type = module->globals[module_global_idx].ref_type;
+#if WASM_ENABLE_GC != 0
+                    /* WebAssembly GC: global.get in constant expressions can only access immutable globals */
+                    if (module->globals[module_global_idx].type.is_mutable) {
+                        set_error_buf(error_buf, error_buf_size, 
+                                      "global.get can only access immutable globals in constant expressions");
+                        return false;
+                    }
+#endif
                 }
                 if (!wasm_reftype_is_subtype_of(
                         global_type, global_ref_type, global->type.val_type,

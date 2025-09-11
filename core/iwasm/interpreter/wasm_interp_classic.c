@@ -28,6 +28,130 @@
 #include "../fast-jit/jit_compiler.h"
 #endif
 
+#if WASM_ENABLE_GC != 0
+/* Global debug counter for tracking GET_REF operations */
+static uint32 debug_get_ref_counter = 0;
+
+/* GC Pointer validation to detect corruption */
+static bool
+validate_gc_pointer(WASMObjectRef gc_obj, const char* operation, void* location)
+{
+    if (!gc_obj) {
+        return true; /* NULL is valid */
+    }
+    
+    /* Check for the specific corruption patterns we're seeing */
+    uintptr_t ptr_val = (uintptr_t)gc_obj;
+    
+    /* Pattern 1: 0x5xxx00000000 corruption */
+    if ((ptr_val & 0xFFFF000000000000ULL) == 0x5000000000000000ULL && 
+        (ptr_val & 0x0000FFFFFFFFULL) == 0) {
+        printf("[GC_CORRUPTION] DETECTED: Pattern 0x5xxx00000000 corruption! Pointer 0x%p during %s at location %p\n", 
+               (void*)gc_obj, operation, location);
+        return false;
+    }
+    
+    /* Check for obviously invalid pointers */
+    if (((uintptr_t)gc_obj & 0xFFFF000000000000ULL) == 0x5555000000000000ULL) {
+        printf("[GC_CORRUPTION] DETECTED: Invalid pointer 0x%p during %s at location %p\n", 
+               (void*)gc_obj, operation, location);
+        printf("[GC_CORRUPTION] This looks like a corrupted heap pointer pattern\n");
+        return false;
+    }
+    
+    /* Check for common corruption patterns */
+    if (ptr_val < 0x1000 || (ptr_val & 0xFFFFFFFF00000000ULL) == 0) {
+        printf("[GC_CORRUPTION] Suspicious pointer 0x%p during %s at location %p\n", 
+               (void*)gc_obj, operation, location);
+        return false;
+    }
+    
+    return true;
+}
+
+/* Debug wrapper for all GET_REF_FROM_ADDR operations in this file */
+#ifdef GET_REF_FROM_ADDR
+#undef GET_REF_FROM_ADDR
+#define GET_REF_FROM_ADDR(addr) debug_get_ref_from_addr((addr), __func__, __LINE__)
+
+static WASMObjectRef
+debug_get_ref_from_addr(void* addr, const char* func, int line)
+{
+    WASMObjectRef obj = (*(void **)(addr));
+    
+    /* Debug GC object dereferencing issues */
+    if (obj && ((uintptr_t)obj & 0xFFFF) == 0x2a) {
+        printf("[GC_DEREF_DEBUG] Attempting to access GC object at %p from %s:%d\n", 
+               obj, func, line);
+        printf("[GC_DEREF_DEBUG] Checking object validity...\n");
+        
+        /* Check if this appears to be a valid GC object */
+        if (!wasm_obj_is_created_from_heap(obj)) {
+            printf("[GC_DEREF_DEBUG] ERROR: Object %p not recognized as valid heap GC object\n", obj);
+        } else {
+            printf("[GC_DEREF_DEBUG] SUCCESS: Object %p is valid heap GC object\n", obj);
+        }
+    }
+    debug_get_ref_counter++;
+    
+    /* Log every 100th operation to avoid spam, but log corrupted ones immediately */
+    bool should_log = (debug_get_ref_counter % 100 == 0);
+    uintptr_t ptr_val = (uintptr_t)obj;
+    bool is_corrupted = false;
+    
+    /* Detect corruption patterns */
+    if (obj && ((ptr_val & 0xFFFF000000000000ULL) == 0x5000000000000000ULL && 
+                (ptr_val & 0x0000FFFFFFFFULL) == 0)) {
+        is_corrupted = true;
+        should_log = true;
+    }
+    
+    if (should_log || is_corrupted) {
+        printf("[DEBUG_GET_REF] #%u: Retrieved 0x%p from %p in %s:%d%s\n", 
+               debug_get_ref_counter, (void*)obj, addr, func, line,
+               is_corrupted ? " ***CORRUPTED***" : "");
+    }
+    
+    if (is_corrupted) {
+        printf("[DEBUG_GET_REF] CORRUPTION DETAILS: Pattern 0x%016llx\n", 
+               (unsigned long long)ptr_val);
+        
+        /* Show memory context */
+        uint64* data = (uint64*)((uintptr_t)addr & ~7ULL);
+        for (int i = -1; i <= 1; i++) {
+            printf("[DEBUG_GET_REF]   %p: 0x%016llx\n", 
+                   (void*)(data + i), (unsigned long long)(data[i]));
+        }
+    }
+    
+    return obj;
+}
+#endif
+
+/* Validated GET_REF_FROM_ADDR wrapper */
+static WASMObjectRef
+get_ref_from_addr_validated(void* addr, const char* operation)
+{
+    /* Use direct pointer access instead of potentially problematic GET_REF_FROM_ADDR macro */
+    WASMObjectRef obj = (WASMObjectRef)(*(void **)addr);
+    printf("[GET_REF] Retrieved object 0x%p during %s from location %p\n", 
+           (void*)obj, operation, addr);
+    
+    if (!validate_gc_pointer(obj, operation, addr)) {
+        printf("[GC_CORRUPTION] Stack/memory contents around corrupted location %p:\n", addr);
+        uint64* data = (uint64*)((uintptr_t)addr & ~7ULL); /* Align to 8-byte boundary */
+        for (int i = -2; i <= 2; i++) {
+            printf("[GC_CORRUPTION]   %p: 0x%016llx\n", 
+                   (void*)(data + i), (unsigned long long)(data[i]));
+        }
+        
+        /* Also check the frame reference state at this location */
+        printf("[GC_CORRUPTION] Checking frame reference state for this corruption\n");
+    }
+    return obj;
+}
+#endif
+
 typedef int32 CellType_I32;
 typedef int64 CellType_I64;
 typedef float32 CellType_F32;
@@ -489,6 +613,8 @@ wasm_interp_get_frame_ref(WASMInterpFrame *frame)
 #define PUSH_I31REF(value)                \
     do {                                  \
         PUT_REF_TO_ADDR(frame_sp, value); \
+        frame_ref_tmp = FRAME_REF(frame_sp); \
+        *frame_ref_tmp = *(frame_ref_tmp + 1) = 0; \
         frame_sp += 2;                    \
     } while (0)
 #else
@@ -502,6 +628,8 @@ wasm_interp_get_frame_ref(WASMInterpFrame *frame)
 #define PUSH_I31REF(value)                \
     do {                                  \
         PUT_REF_TO_ADDR(frame_sp, value); \
+        frame_ref_tmp = FRAME_REF(frame_sp); \
+        *frame_ref_tmp = 0;                \
         frame_sp++;                       \
     } while (0)
 #endif
@@ -1144,6 +1272,8 @@ word_copy(uint32 *dest, uint32 *src, unsigned num)
     if (dest != src) {
         /* No overlap buffer */
         bh_assert(!((src < dest) && (dest < src + num)));
+        
+        
         for (; num > 0; num--)
             *dest++ = *src++;
     }
@@ -1153,9 +1283,40 @@ word_copy(uint32 *dest, uint32 *src, unsigned num)
 static inline void
 frame_ref_copy(uint8 *frame_ref_dest, uint8 *frame_ref_src, unsigned num)
 {
-    if (frame_ref_dest != frame_ref_src)
-        for (; num > 0; num--)
-            *frame_ref_dest++ = *frame_ref_src++;
+    if (frame_ref_dest != frame_ref_src) {
+        printf("[FRAME_REF] Copying %u frame references from %p to %p\n", 
+               num, (void*)frame_ref_src, (void*)frame_ref_dest);
+        
+        for (unsigned i = 0; i < num; i++) {
+            uint8 ref_val = frame_ref_src[i];
+            
+            /* CRITICAL: Validate frame reference values */
+            if (ref_val != 0 && ref_val != 1) {
+                printf("[FRAME_REF] CORRUPTION DETECTED: Invalid frame reference value %d at position %u\n", 
+                       ref_val, i);
+                printf("[FRAME_REF] Source array %p, dest array %p, copying %u values\n", 
+                       (void*)frame_ref_src, (void*)frame_ref_dest, num);
+                
+                /* Show surrounding memory context */
+                printf("[FRAME_REF] Memory context around source[%u]:\n", i);
+                for (int j = -2; j <= 2; j++) {
+                    if (i + j < num && i + j >= 0) {
+                        printf("[FRAME_REF]   src[%d]: %d\n", (int)(i + j), frame_ref_src[i + j]);
+                    }
+                }
+                
+                /* Force value to 0 to prevent corruption propagation */
+                printf("[FRAME_REF] Forcing corrupted value to 0 to prevent further corruption\n");
+                ref_val = 0;
+            }
+            
+            if (ref_val != 0) {
+                printf("[FRAME_REF] Copying reference flag at position %u: %d\n", 
+                       i, ref_val);
+            }
+            *frame_ref_dest++ = ref_val;
+        }
+    }
 }
 #else
 #define frame_ref_copy(frame_ref_dst, frame_ref_src, num) (void)0
@@ -2690,7 +2851,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 CHECK_SUSPEND_FLAGS();
 #endif
                 read_leb_uint32(frame_ip, frame_ip_end, depth);
-                gc_obj = GET_REF_FROM_ADDR(frame_sp - REF_CELL_NUM);
+                gc_obj = get_ref_from_addr_validated(frame_sp - REF_CELL_NUM, "BR_ON_NON_NULL");
                 if (gc_obj == NULL_REF) {
                     frame_sp -= REF_CELL_NUM;
                     CLEAR_FRAME_REF(frame_sp, REF_CELL_NUM);
@@ -2705,7 +2866,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 CHECK_SUSPEND_FLAGS();
 #endif
                 read_leb_uint32(frame_ip, frame_ip_end, depth);
-                gc_obj = GET_REF_FROM_ADDR(frame_sp - REF_CELL_NUM);
+                gc_obj = get_ref_from_addr_validated(frame_sp - REF_CELL_NUM, "BR_ON_NULL");
                 if (gc_obj != NULL_REF) {
                     goto label_pop_csp_n;
                 }
@@ -3219,6 +3380,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
                         i31_val = POP_I32();
                         i31_obj = wasm_i31_obj_new(i31_val);
+                        if (i31_val == 42 || i31_val == 85 || i31_val == 5) {
+                            printf("[REF_I31] Creating i31 ref: raw=%u, encoded=0x%lx\n", i31_val, (uintptr_t)i31_obj);
+                        }
                         PUSH_I31REF(i31_obj);
                         HANDLE_OP_END();
                     }
@@ -3233,10 +3397,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                             goto got_exception;
                         }
                         i31_val = (uint32)(((uintptr_t)i31_obj) >> 1);
+                        if (i31_val == 42 || i31_val == 85 || i31_val == 5 || i31_val == 2) {
+                            printf("[I31_GET] Extracting from i31 ref: encoded=0x%lx, raw=%u\n", (uintptr_t)i31_obj, i31_val);
+                        }
                         if (opcode == WASM_OP_I31_GET_S
                             && (i31_val & 0x40000000) /* bit 30 is 1 */)
                             /* set bit 31 to 1 */
                             i31_val |= 0x80000000;
+                            
                         PUSH_I32(i31_val);
                         HANDLE_OP_END();
                     }
@@ -3247,10 +3415,15 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                     case WASM_OP_REF_CAST_NULLABLE:
                     {
                         int32 heap_type;
+                        const char* opcode_name = 
+                            opcode == WASM_OP_REF_TEST ? "REF_TEST" :
+                            opcode == WASM_OP_REF_CAST ? "REF_CAST" :
+                            opcode == WASM_OP_REF_TEST_NULLABLE ? "REF_TEST_NULLABLE" :
+                            "REF_CAST_NULLABLE";
 
                         read_leb_int32(frame_ip, frame_ip_end, heap_type);
-
-                        gc_obj = GET_REF_FROM_ADDR(frame_sp - REF_CELL_NUM);
+                        
+                        gc_obj = get_ref_from_addr_validated(frame_sp - REF_CELL_NUM, "REF_CAST/REF_TEST");
                         if (!gc_obj) {
                             if (opcode == WASM_OP_REF_TEST
                                 || opcode == WASM_OP_REF_TEST_NULLABLE) {
@@ -3271,16 +3444,32 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         else {
                             bool castable = false;
 
+                            /* Debug cast operations for objects ending in 0x2a */
+                            if (((uintptr_t)gc_obj & 0xFFFF) == 0x2a) {
+                                printf("[CAST_DEBUG] Attempting cast of object %p to heap_type %d\n", 
+                                       gc_obj, heap_type);
+                            }
+
                             if (heap_type >= 0) {
                                 WASMModule *wasm_module = module->module;
                                 castable = wasm_obj_is_instance_of(
                                     gc_obj, (uint32)heap_type,
                                     wasm_module->types,
                                     wasm_module->type_count);
+                                    
+                                if (((uintptr_t)gc_obj & 0xFFFF) == 0x2a) {
+                                    printf("[CAST_DEBUG] wasm_obj_is_instance_of returned: %s\n", 
+                                           castable ? "TRUE" : "FALSE");
+                                }
                             }
                             else {
                                 castable =
                                     wasm_obj_is_type_of(gc_obj, heap_type);
+                                    
+                                if (((uintptr_t)gc_obj & 0xFFFF) == 0x2a) {
+                                    printf("[CAST_DEBUG] wasm_obj_is_type_of returned: %s\n", 
+                                           castable ? "TRUE" : "FALSE");
+                                }
                             }
 
                             if (opcode == WASM_OP_REF_TEST
@@ -3294,6 +3483,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                             else if (!castable) {
                                 wasm_set_exception(module, "cast failure");
                                 goto got_exception;
+                            }
+                            else {
+                                /* Cast successful */
                             }
                         }
                         HANDLE_OP_END();
@@ -3313,7 +3505,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         read_leb_int32(frame_ip, frame_ip_end, heap_type);
                         read_leb_int32(frame_ip, frame_ip_end, heap_type_dst);
 
-                        gc_obj = GET_REF_FROM_ADDR(frame_sp - REF_CELL_NUM);
+                        gc_obj = get_ref_from_addr_validated(frame_sp - REF_CELL_NUM, "BR_ON_CAST");
                         if (!gc_obj) {
                             /*
                              * castflags should be 0~3:
@@ -6603,9 +6795,47 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
     call_func_from_return_call:
     {
         POP(cur_func->param_cell_num);
+        /* Copy parameters directly to final destination before freeing frame to avoid GC issues */
         if (cur_func->param_cell_num > 0) {
-            word_copy(frame->lp, frame_sp, cur_func->param_cell_num);
+            /* Get the destination frame location while current frame is still valid */
+            WASMInterpFrame *outs_area = wasm_exec_env_wasm_stack_top(exec_env);
+            
+            /* Copy parameters directly to final location while both frames exist */
+            printf("[PARAM_COPY] Tail call: copying %d cells from %p to %p\n", 
+                   cur_func->param_cell_num, (void*)frame_sp, (void*)outs_area->lp);
+            
+            /* Validate source pointers before copying */
+            for (uint32 param_idx = 0; param_idx < cur_func->param_cell_num; param_idx++) {
+                if (FRAME_REF(frame_sp)[param_idx]) {
+                    WASMObjectRef src_obj = get_ref_from_addr_validated(frame_sp + param_idx, "tail-call param copy src");
+                    printf("[PARAM_COPY] Source param %d: GC object %p\n", param_idx, (void*)src_obj);
+                }
+            }
+            
+            word_copy(outs_area->lp, frame_sp, cur_func->param_cell_num);
+#if WASM_ENABLE_GC != 0
+            /* Copy GC reference flags directly to final location */
+            frame_ref_copy(FRAME_REF(outs_area->lp), FRAME_REF(frame_sp), cur_func->param_cell_num);
+            
+            /* Validate destination pointers after copying */
+            for (uint32 param_idx = 0; param_idx < cur_func->param_cell_num; param_idx++) {
+                if (FRAME_REF(outs_area->lp)[param_idx]) {
+                    WASMObjectRef dst_obj = get_ref_from_addr_validated(outs_area->lp + param_idx, "tail-call param copy dst");
+                    
+                    /* Clear frame reference flag for i31 references to prevent corruption */
+                    if (dst_obj && wasm_obj_is_i31_obj(dst_obj)) {
+                        printf("[I31_FIX] Clearing frame reference flag for i31 reference %p at param %d\n", 
+                               (void*)dst_obj, param_idx);
+                        FRAME_REF(outs_area->lp)[param_idx] = 0;
+                    } else {
+                        printf("[PARAM_COPY] Dest param %d: GC object %p\n", param_idx, (void*)dst_obj);
+                    }
+                }
+            }
+#endif
         }
+        
+        /* Now safe to free frame - parameters are already in their final location */
         FREE_FRAME(exec_env, frame);
         wasm_exec_env_set_cur_frame(exec_env, prev_frame);
         is_return_call = true;
@@ -6617,8 +6847,40 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
         /* Only do the copy when it's called from interpreter.  */
         WASMInterpFrame *outs_area = wasm_exec_env_wasm_stack_top(exec_env);
         if (cur_func->param_cell_num > 0) {
+            printf("[PARAM_COPY] Normal call: copying %d cells from %p to %p\n", 
+                   cur_func->param_cell_num, (void*)frame_sp, (void*)outs_area->lp);
+            
             POP(cur_func->param_cell_num);
+            
+            /* Validate source pointers before copying */
+            for (uint32 param_idx = 0; param_idx < cur_func->param_cell_num; param_idx++) {
+                if (FRAME_REF(frame_sp)[param_idx]) {
+                    WASMObjectRef src_obj = get_ref_from_addr_validated(frame_sp + param_idx, "normal-call param copy src");
+                    printf("[PARAM_COPY] Source param %d: GC object %p\n", param_idx, (void*)src_obj);
+                }
+            }
+            
             word_copy(outs_area->lp, frame_sp, cur_func->param_cell_num);
+#if WASM_ENABLE_GC != 0
+            /* Copy GC reference flags for function call parameters */
+            frame_ref_copy(FRAME_REF(outs_area->lp), FRAME_REF(frame_sp), cur_func->param_cell_num);
+            
+            /* Validate destination pointers after copying */
+            for (uint32 param_idx = 0; param_idx < cur_func->param_cell_num; param_idx++) {
+                if (FRAME_REF(outs_area->lp)[param_idx]) {
+                    WASMObjectRef dst_obj = get_ref_from_addr_validated(outs_area->lp + param_idx, "normal-call param copy dst");
+                    
+                    /* Clear frame reference flag for i31 references to prevent corruption */
+                    if (dst_obj && wasm_obj_is_i31_obj(dst_obj)) {
+                        printf("[I31_FIX] Clearing frame reference flag for i31 reference %p at param %d\n", 
+                               (void*)dst_obj, param_idx);
+                        FRAME_REF(outs_area->lp)[param_idx] = 0;
+                    } else {
+                        printf("[PARAM_COPY] Dest param %d: GC object %p\n", param_idx, (void*)dst_obj);
+                    }
+                }
+            }
+#endif
         }
         SYNC_ALL_TO_FRAME();
         prev_frame = frame;
@@ -6899,21 +7161,43 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 }
 
 #if WASM_ENABLE_GC != 0
+
 bool
 wasm_interp_traverse_gc_rootset(WASMExecEnv *exec_env, void *heap)
 {
     WASMInterpFrame *frame;
     WASMObjectRef gc_obj;
     int i;
+    int frame_count = 0;
 
+    printf("[GC_TRAVERSE] Starting GC root traversal\n");
+    
     frame = wasm_exec_env_get_cur_frame(exec_env);
     for (; frame; frame = frame->prev_frame) {
         uint8 *frame_ref = get_frame_ref(frame);
+        int slots_checked = 0, roots_found = 0;
+        
+        printf("[GC_TRAVERSE] Frame %d: checking %d slots\n", 
+               frame_count, (int)(frame->sp - frame->lp));
+        
         for (i = 0; i < frame->sp - frame->lp; i++) {
             if (frame_ref[i]) {
-                gc_obj = GET_REF_FROM_ADDR(frame->lp + i);
+                slots_checked++;
+                gc_obj = get_ref_from_addr_validated(frame->lp + i, "GC traversal");
+                
+                if (!validate_gc_pointer(gc_obj, "GC traversal", frame->lp + i)) {
+                    printf("[GC_TRAVERSE] ABORTING: Corrupted pointer detected in frame %d slot %d\n", 
+                           frame_count, i);
+                    return false;
+                }
+                
                 if (wasm_obj_is_created_from_heap(gc_obj)) {
+                    roots_found++;
+                    printf("[GC_TRAVERSE] Adding root: 0x%p from frame %d slot %d\n", 
+                           (void*)gc_obj, frame_count, i);
+                    
                     if (mem_allocator_add_root((mem_allocator_t)heap, gc_obj)) {
+                        printf("[GC_TRAVERSE] ERROR: Failed to add root 0x%p\n", (void*)gc_obj);
                         return false;
                     }
                 }
@@ -6923,7 +7207,13 @@ wasm_interp_traverse_gc_rootset(WASMExecEnv *exec_env, void *heap)
 #endif
             }
         }
+        
+        printf("[GC_TRAVERSE] Frame %d complete: %d slots checked, %d roots found\n", 
+               frame_count, slots_checked, roots_found);
+        frame_count++;
     }
+    
+    printf("[GC_TRAVERSE] Completed traversal of %d frames\n", frame_count);
     return true;
 }
 #endif
